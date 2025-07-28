@@ -1,0 +1,4 @@
+requests
+crewai
+git+https://github.com/google/adk-python.git
+pandas
