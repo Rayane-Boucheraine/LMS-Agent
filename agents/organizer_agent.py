@@ -1,67 +1,183 @@
 import json
 import os
+import re
+import time
+from collections import defaultdict
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaInMemoryUpload
-from config.config import LABELED_POSTS_FILE, GOOGLE_CREDENTIALS_PATH
+from googleapiclient.errors import HttpError
+from config.config import LABELED_POSTS_FILE, GOOGLE_CREDENTIALS_PATH, SHARED_DRIVE_ID
 
-# إعداد Google Drive API
+# 1️⃣ Google Drive API setup
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 creds = service_account.Credentials.from_service_account_file(
     GOOGLE_CREDENTIALS_PATH, scopes=SCOPES
 )
 drive_service = build("drive", "v3", credentials=creds)
 
-# إنشاء فولدر في Google Drive
-def create_folder(name, parent_id=None):
-    query = f"name='{name}' and mimeType='application/vnd.google-apps.folder'"
-    if parent_id:
-        query += f" and '{parent_id}' in parents"
-    results = drive_service.files().list(q=query, fields="files(id)").execute()
-    if results["files"]:
-        return results["files"][0]["id"]
+# 2️⃣ Folder groups for regrouping
+FOLDER_GROUPS = {
+    "Study": [
+        "Study Materials", "Study Material", "Study Resources",
+        "Study Aid", "Study Help", "Study Notes", "Notes",
+        "Study/Summary", "Study/School", "Study Skills",
+        "Study Guides & Summaries", "Study Guides/Summaries"
+    ],
+    "Summaries": [
+        "Summaries", "Summary", "Résumé",
+        "Study Notes/Summary", "Study Materials/Summary",
+        "Study Materials/Summaries", "Study Skills/Summarization",
+        "Study Aid/Summary", "Summaries/Note-Taking", "Summaries/Notes",
+        "Study Skills/Note Taking/Summarization"
+    ],
+    "Medicine": [
+        "Medicine", "Medical Studies", "Medical School",
+        "Healthcare Documentation", "Medical Residency",
+        "Medical Residency Exam Preparation", "Medical Residency Exams",
+        "Medical Residency Preparation", "Medical Residency Entrance Exam Preparation",
+        "Medical Residency Exam Preparation (Ophthalmology)",
+        "Medicine (Specifically Endocrinology And Diabetology Residency Exam Preparation)",
+        "Medicine (UMC)"
+    ],
+    "Biology": [
+        "Biology", "Histology", "Cell Biology",
+        "Anatomy", "Physiology", "Neuroscience", "Hematology",
+        "Biochemistry", "Pathology", "Cellular Pathology", "Anatomy And Pathology"
+    ],
+    "Cardiology": [
+        "Cardiology", "Electrocardiography", "Electrocardiography (Ecg)",
+        "Tachycardia", "Hemorrhage And Hemorrhagic Shock", "Atherosclerosis"
+    ],
+    "Pulmonology": [
+        "Pulmonology", "Respiratory Medicine", "Pulmonary Examination",
+        "Respiratory Sounds", "Acute Respiratory Distress Syndrome", "Snoring"
+    ],
+    "Psychiatry": ["Psychiatry"],
+    "Pediatrics": ["Pediatrics"],
+    "Urology": ["Urology"],
+    "Islamic Studies": ["Islamic Studies/Guidance/Exam Preparation"],
+    "Economics": ["Economics"],
+    "French Language": ["French Language"],
+    "Career Advice": ["Career Advice"],
+    "Exams": ["Exams"],
+    "Mathematics": ["Mathematics"],
+    "Diabetes": [
+        "Diabetes", "Diabète Type 1", "Diabète Type 2",
+        "Comparaison Entre Le Diabète De Type 1 Et Le Diabète De Type 2",
+        "Définition Et Classification Du Diabète Sucré"
+    ],
+    "Immunology": ["Immunology"],
+    "Neurology": ["Neurology", "Intracranial Hypertension", "Hydrocéphalie"],
+    "Radiology": ["Radiology"],
+    "Resume": ["Resume", "Resume Writing"],
+    "Youtube Milestone": ["Youtube Milestone"],
+}
 
-    file_metadata = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
-    if parent_id:
-        file_metadata["parents"] = [parent_id]
-    folder = drive_service.files().create(body=file_metadata, fields="id").execute()
-    return folder.get("id")
+# 3️⃣ Normalize subject names
+def normalize_text(text):
+    if not text:
+        return ""
+    return re.sub(r"\s+", " ", text.strip()).title()
 
-# رفع ملف JSON
-def upload_json(name, content, folder_id):
-    file_metadata = {"name": name, "parents": [folder_id], "mimeType": "application/json"}
-    media = MediaInMemoryUpload(content.encode("utf-8"), mimetype="application/json")
-    drive_service.files().create(body=file_metadata, media_body=media).execute()
+# 4️⃣ Create HTML body with clickable links
+def build_html_body(videos):
+    html = "<!DOCTYPE html><html><body><h2>Videos</h2><ul>"
+    for v in videos:
+        url = v.get("url", "#")
+        title = v.get("title", url)
+        html += f'<li><a href="{url}" target="_blank">{title}</a></li>'
+    html += "</ul></body></html>"
+    return html
+
+# 5️⃣ Get or create folder in Shared Drive
+def get_or_create_folder(name, parent_id):
+    q = (
+        f"name='{name}' and '{parent_id}' in parents "
+        "and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    )
+    res = drive_service.files().list(
+        q=q,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        fields="files(id)"
+    ).execute()
+    files = res.get("files", [])
+    if files:
+        return files[0]["id"]
+
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id]
+    }
+    folder = drive_service.files().create(
+        body=metadata,
+        supportsAllDrives=True,
+        fields="id"
+    ).execute()
+    return folder["id"]
+
+# 6️⃣ Upload Google Doc with retry for 500 errors
+def upload_doc(name, html_content, folder_id):
+    media = MediaInMemoryUpload(html_content.encode("utf-8"), mimetype="text/html")
+    metadata = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.document",
+        "parents": [folder_id]
+    }
+
+    for attempt in range(5):
+        try:
+            drive_service.files().create(
+                body=metadata,
+                media_body=media,
+                supportsAllDrives=True,
+                fields="id"
+            ).execute()
+            return
+        except HttpError as e:
+            if e.resp.status == 500:
+                wait_time = 2 ** attempt
+                print(f"[WARN] Google Drive 500 error, retrying in {wait_time}s...")
+                time.sleep(wait_time)
+            else:
+                raise
 
 def main():
     if not os.path.exists(LABELED_POSTS_FILE):
-        print("[ERROR] labeled_posts.json not found")
+        print(f"[ERROR] File not found: {LABELED_POSTS_FILE}")
         return
 
-    with open(LABELED_POSTS_FILE, "r") as f:
+    with open(LABELED_POSTS_FILE, "r", encoding="utf-8") as f:
         posts = json.load(f)
-
     if not posts:
-        print("[INFO] No posts to organize")
+        print("[INFO] No posts to process")
         return
 
-    # إنشاء مجلد رئيسي ومجلدات فرعية
-    root_id = create_folder("LMS Organized Data")
-    courses_id = create_folder("Courses", root_id)
-    exams_id = create_folder("Exams", root_id)
-    others_id = create_folder("Other", root_id)
+    grouped = defaultdict(list)
+    for p in posts:
+        subj_raw = normalize_text(p.get("subject", ""))
+        main_folder = None
+        for mf, variants in FOLDER_GROUPS.items():
+            if subj_raw in variants:
+                main_folder = mf
+                break
+        if not main_folder:
+            main_folder = subj_raw
+        grouped[(main_folder, subj_raw)].append(p)
 
-    # تصنيف البوستات
-    courses = [p for p in posts if p["type"] == "Course"]
-    exams = [p for p in posts if p["type"] == "Exam"]
-    others = [p for p in posts if p["type"] not in ["Course", "Exam"]]
+    root_id = SHARED_DRIVE_ID
 
-    # رفع الملفات
-    upload_json("courses.json", json.dumps(courses, indent=2, ensure_ascii=False), courses_id)
-    upload_json("exams.json", json.dumps(exams, indent=2, ensure_ascii=False), exams_id)
-    upload_json("others.json", json.dumps(others, indent=2, ensure_ascii=False), others_id)
+    for (main_folder, subj), vids in grouped.items():
+        folder_id = get_or_create_folder(main_folder, root_id)
+        doc_name = f"{subj}.doc"
+        html = build_html_body(vids)
+        upload_doc(doc_name, html, folder_id)
+        print(f"[INFO] Uploaded {len(vids)} videos as Doc '{main_folder}/{doc_name}'")
+        time.sleep(0.5)  # small delay to avoid rate limit
 
-    print("[INFO] Data organized and uploaded to Google Drive")
+    print("[INFO] ✅ All organized and uploaded!")
 
 if __name__ == "__main__":
     main()

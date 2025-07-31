@@ -11,16 +11,19 @@ def run_module(module_name):
         sys.exit(1)
 
 def main():
-    # 1️⃣ تشغيل Labeling Agent
+    # 1️⃣ Run Scraper Agent first (optional)
+    run_module("agents.scraper_agent")
+
+    # 2️⃣ Run Labeling Agent
     run_module("agents.labeling_agent")
 
-    # 2️⃣ التأكد من أن labeling نجح وأن الملف موجود
+    # 3️⃣ Ensure labeling created the file
     if not os.path.exists(LABELED_POSTS_FILE):
         print("[ERROR] labeled_posts.json not found, skipping organizing agent.")
         sys.exit(1)
 
-    # 3️⃣ تشغيل Organizing Agent
-    run_module("agents.organize_agent")
+    # 4️⃣ Run Organizer Agent
+    run_module("agents.organizer_agent")
 
     print("[INFO] ✅ Pipeline completed successfully!")
 
