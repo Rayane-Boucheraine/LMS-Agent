@@ -1,5 +1,2 @@
-# Google credentials
 config/credentials.json
-
-# API tokens
 config/config.py
